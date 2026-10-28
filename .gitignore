@@ -1,0 +1,24 @@
+# Local credentials and runtime evidence
+/data/
+.env
+.env.*
+!.env.example
+*.log
+*.sqlite
+*.sqlite3
+*.db
+agents_llm_config.json
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS metadata
+.idea/
+.vscode/
+.DS_Store
