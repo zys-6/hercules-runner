@@ -67,7 +67,7 @@ def authorize(authorization: str = Header(default='')):
         raise HTTPException(401, 'Runner authentication required')
 
 
-def feature(case: Case, url: str, credentials: bool) -> str:
+def feature(case: Case, url: str, credentials: bool, request_marker: str = '') -> str:
     # JSON quoting prevents user text from injecting additional Gherkin scenarios.
     q = lambda text: json.dumps(text, ensure_ascii=False)
     return '\n'.join([
@@ -78,8 +78,12 @@ def feature(case: Case, url: str, credentials: bool) -> str:
          if credentials else '    And no login credentials were supplied; if authentication is required I report an incomplete test'),
         f'    And I establish these preconditions: {q(case.precondition)}',
         '    And I discover missing IDs and API routes from the target UI or API; I never invent values',
+        '    And for a query-only case I use existing records; I must not create, modify or delete business records unless explicitly requested by the case steps',
+        '    And I complete authentication and record discovery before sending the request under test',
         '    And if a destructive action has no uniquely identifiable disposable test record I stop and report the missing prerequisite',
         f'    When I execute the following API test steps using the API helper and the authenticated session: {q(case.steps)}',
+        f'    And I send the request under test exactly once with the additional HTTP header X-Hercules-Request-Id: {q(request_marker)}; I must not put this header on login, discovery, setup or follow-up requests',
+        '    And I evaluate the assertions on that marked response, including errors, without retrying it to obtain a passing result',
         '    And I execute each tested write request only once and retain the original API response as evidence',
         f'    Then I verify the expected outcome: {q(case.expectedResult)}',
         '    And I report failed assertions accurately; missing evidence or prerequisites mean incomplete, never passed',
@@ -87,7 +91,7 @@ def feature(case: Case, url: str, credentials: bool) -> str:
     ])
 
 
-def inspect_evidence(work: Path, case: Case, target_url: str = '') -> tuple[str, dict]:
+def _inspect_evidence(work: Path, case: Case, target_url: str = '', request_marker: str = '') -> tuple[str, dict]:
     """Verify explicit API assertions against original CLI API logs; never replay HTTP."""
     files = list((work / 'output').rglob('*.xml'))
     if len(files) != 1:
@@ -133,6 +137,8 @@ def inspect_evidence(work: Path, case: Case, target_url: str = '') -> tuple[str,
     pattern = re.escape(path)
     pattern = re.sub(r'\\\{\\\{.*?\\\}\\\}', '[^/]+', pattern)
     matches = []
+    marked = []
+    marker_request_count = 0
     for logfile in work.rglob('api_logs.log'):
         pending = None
         for line in logfile.read_text(errors='replace').splitlines():
@@ -142,15 +148,30 @@ def inspect_evidence(work: Path, case: Case, target_url: str = '') -> tuple[str,
                 continue
             if 'request_data' in event:
                 pending = event['request_data']
+                headers = {str(k).lower(): v for k, v in pending.get('headers', {}).items()}
+                if request_marker and headers.get('x-hercules-request-id') == request_marker:
+                    marker_request_count += 1
             elif 'response_data' in event and pending:
                 actual_url = urlsplit(pending.get('url', ''))
                 origin_matches = not expected_url.netloc or (actual_url.scheme, actual_url.netloc) == (expected_url.scheme, expected_url.netloc)
                 if origin_matches and pending.get('method', '').upper() == method.upper() and re.fullmatch(pattern, actual_url.path):
                     matches.append(event['response_data'])
+                    headers = {str(k).lower(): v for k, v in pending.get('headers', {}).items()}
+                    if request_marker and headers.get('x-hercules-request-id') == request_marker:
+                        marked.append(event['response_data'])
                 pending = None
-    if len(matches) != 1:
-        return 'error', {'reason': 'Original response missing or ambiguous; no requests were replayed'}
-    response = matches[0]
+    match_info = {'matchingResponses': len(matches), 'markedRequests': marker_request_count,
+                  'markedMatchingResponses': len(marked)}
+    if request_marker:
+        if marker_request_count != 1 or len(marked) != 1:
+            return 'error', {'reason': f'Expected exactly one marked request and matching response; marked requests={marker_request_count}, marked responses={len(marked)}, route matches={len(matches)}; no requests were replayed', 'correlation': match_info}
+        response = marked[0]
+    elif len(matches) == 0:
+        return 'error', {'reason': 'No original response matched the declared method, origin and path; no requests were replayed', 'correlation': match_info}
+    elif len(matches) > 1:
+        return 'error', {'reason': f'Multiple original responses matched ({len(matches)}); no requests were replayed', 'correlation': match_info}
+    else:
+        response = matches[0]
     checks = [{'assertion': 'HTTP status', 'passed': response.get('status_code') == int(statuses[0])}]
     try:
         body = json.loads(response.get('body', '')) if assertions else None
@@ -168,9 +189,77 @@ def inspect_evidence(work: Path, case: Case, target_url: str = '') -> tuple[str,
     except (ValueError, KeyError, TypeError, IndexError):
         return 'error', {'reason': 'Could not evaluate a declared assertion from captured response'}
     evidence = {'reason': 'Original API response checked; broader expected outcome evaluated by Hercules',
+                'correlation': match_info,
                 'checks': checks, 'statusCode': response.get('status_code'),
                 'responseSha256': hashlib.sha256(response.get('body', '').encode()).hexdigest()}
     return ('passed' if all(c['passed'] for c in checks) else 'failed'), evidence
+
+
+
+def diagnostic_summary(work: Path) -> dict:
+    """Retain only fixed categories, methods and status codes, never free-form secrets."""
+    from urllib.parse import urlsplit
+    exchanges = []
+    malformed = 0
+    for logfile in work.rglob('api_logs.log'):
+        pending = None
+        for line in logfile.read_text(errors='replace').splitlines():
+            try:
+                event = json.loads(line)
+                if not isinstance(event, dict):
+                    continue
+                if isinstance(event.get('request_data'), dict):
+                    pending = event['request_data']
+                elif isinstance(event.get('response_data'), dict) and pending:
+                    path = urlsplit(str(pending.get('url', ''))).path.lower()
+                    route = 'login' if any(x in path for x in ('/login', '/auth', '/token')) else (
+                        'contract_list' if path.rstrip('/') == '/api/contracts' else (
+                        'contract_detail' if path.startswith('/api/contracts/') else 'other'))
+                    method = pending.get('method', '').upper()
+                    status = event['response_data'].get('status_code')
+                    if method in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS') and type(status) is int and 100 <= status <= 599:
+                        exchanges.append({'route': route, 'method': method, 'status': status})
+                    pending = None
+            except (ValueError, TypeError, AttributeError):
+                malformed += 1
+    # Classify only explicit failure language. These are model-reported hints, not verified causes.
+    hints = set()
+    for report in (work / 'output').rglob('*.xml'):
+        try:
+            root = ET.parse(report).getroot()
+        except ET.ParseError:
+            continue
+        for node in root.iter():
+            if node.tag not in ('failure', 'error', 'system-out'):
+                continue
+            text = ((node.text or '') + ' ' + node.get('message', '')).lower()
+            rules = {
+                'authentication': r'login failed|authentication failed|unauthorized|forbidden|invalid credentials|登录失败|认证失败|未授权',
+                'missing_test_data': r'no contracts? found|no matching contract|no suitable contract|missing contract.?id|无法.*合同.*id|未找到.*合同',
+                'connection': r'connection refused|connection error|无法连接|连接失败',
+                'timeout': r'timed out|timeout|超时',
+                'assertion_mismatch': r'assertion failed|expected.*but.*(?:got|returned|was)|断言失败',
+            }
+            for category, pattern in rules.items():
+                if re.search(pattern, text):
+                    hints.add(category)
+    return {'httpExchanges': exchanges[-20:], 'httpExchangeCount': len(exchanges),
+            'modelReportedHints': sorted(hints), 'malformedLogLines': malformed}
+
+
+def inspect_evidence(work: Path, case: Case, target_url: str = '', request_marker: str = '') -> tuple[str, dict]:
+    try:
+        state, evidence = _inspect_evidence(work, case, target_url, request_marker)
+    except (ET.ParseError, ValueError, KeyError, TypeError, AttributeError):
+        state, evidence = 'error', {'reason': 'Could not parse Hercules evidence'}
+    diagnostics = diagnostic_summary(work)
+    evidence['diagnostics'] = diagnostics
+    if state != 'passed':
+        exchanges = diagnostics['httpExchanges']
+        http = ', '.join(f"{x['route']} {x['method']}={x['status']}" for x in exchanges) or 'no captured API responses'
+        hints = ', '.join(diagnostics['modelReportedHints']) or 'none'
+        evidence['reason'] += f'; HTTP: {http}; model-reported hints: {hints}'
+    return state, evidence
 
 
 class Engine:
@@ -288,7 +377,8 @@ class Engine:
         try:
             for folder in ('input', 'output', 'test_data'):
                 (work / folder).mkdir(mode=0o700)
-            (work / 'input/test.feature').write_text(feature(case, request.targetUrl, bool(request.loginUsername)))
+            request_marker = f'{run_id}:{case.caseId}'
+            (work / 'input/test.feature').write_text(feature(case, request.targetUrl, bool(request.loginUsername), request_marker))
             if request.loginUsername:
                 credential_path = work / 'test_data/credentials.json'
                 credential_path.write_text(json.dumps({'username': request.loginUsername, 'password': request.loginPassword.get_secret_value()}))
@@ -318,7 +408,7 @@ class Engine:
                     self.process = None
             if code != 0:
                 return 'error', {'reason': f'Hercules exited with code {code}'}
-            return inspect_evidence(work, case, request.targetUrl)
+            return inspect_evidence(work, case, request.targetUrl, request_marker)
         finally:
             shutil.rmtree(work)
 

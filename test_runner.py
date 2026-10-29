@@ -57,6 +57,62 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(state, 'failed')
         self.assertNotIn('secret', json.dumps(evidence))
 
+    def marker_events(self, marked_status=200, duplicate=False, omit=False):
+        events = []
+        for identifier, headers, status in [(100, {}, 200), (200, {} if omit else {'X-Hercules-Request-Id': 'run:1'}, marked_status), (300, {}, 200)]:
+            events += [{'request_data': {'method': 'GET', 'url': f'http://localhost/api/contracts/{identifier}', 'headers': headers}},
+                       {'response_data': {'status_code': status, 'body': '{"code":0}'}}]
+        if duplicate:
+            events.extend(events[2:4])
+        (self.root / 'api_logs.log').write_text('\n'.join(map(json.dumps, events)))
+        self.case.steps = self.case.steps.replace('DELETE', 'GET')
+
+    def test_marker_selects_test_response_among_discovery_reads(self):
+        self.marker_events()
+        state, evidence = runner.inspect_evidence(self.root, self.case, 'http://localhost', 'run:1')
+        self.assertEqual(state, 'passed')
+        self.assertEqual(evidence['correlation']['matchingResponses'], 3)
+        self.assertEqual(evidence['correlation']['markedMatchingResponses'], 1)
+
+    def test_marker_never_cherry_picks_a_passing_discovery_response(self):
+        self.marker_events(marked_status=401)
+        self.assertEqual(runner.inspect_evidence(self.root, self.case, 'http://localhost', 'run:1')[0], 'failed')
+
+    def test_duplicate_or_missing_marker_is_error(self):
+        self.marker_events(duplicate=True)
+        self.assertEqual(runner.inspect_evidence(self.root, self.case, 'http://localhost', 'run:1')[0], 'error')
+        self.marker_events(omit=True)
+        self.assertEqual(runner.inspect_evidence(self.root, self.case, 'http://localhost', 'run:1')[0], 'error')
+
+    def test_marker_cannot_override_wrong_target_origin(self):
+        self.marker_events()
+        self.assertEqual(runner.inspect_evidence(self.root, self.case, 'http://elsewhere', 'run:1')[0], 'error')
+
+    def test_feature_instructs_marker_and_no_inferred_query_writes(self):
+        text = runner.feature(self.case, 'http://localhost', True, 'run:1')
+        self.assertIn('X-Hercules-Request-Id', text)
+        self.assertIn('run:1', text)
+        self.assertIn('must not create, modify or delete', text)
+
+    def test_failure_diagnostics_do_not_retain_secrets(self):
+        self.report(child='<failure message="Authentication failed for fixture-user password fixture-secret Bearer hidden-token"/>')
+        events = [{'request_data': {'method': 'GET', 'url': 'http://localhost/api/contracts/123?token=hidden-token', 'headers': {'Authorization': 'Bearer hidden-token'}}},
+                  {'response_data': {'status_code': 401, 'body': '{"password":"fixture-secret"}'}}]
+        (self.root / 'api_logs.log').write_text('\n'.join(map(json.dumps, events)))
+        state, evidence = runner.inspect_evidence(self.root, self.case)
+        self.assertEqual(state, 'failed')
+        encoded = json.dumps(evidence)
+        for secret in ('fixture-user', 'fixture-secret', 'hidden-token', '/123'):
+            self.assertNotIn(secret, encoded)
+        self.assertIn('authentication', encoded)
+        self.assertIn('contract_detail GET=401', evidence['reason'])
+
+    def test_incomplete_has_http_diagnostics(self):
+        self.report('false')
+        state, evidence = runner.inspect_evidence(self.root, self.case)
+        self.assertEqual(state, 'error')
+        self.assertEqual(evidence['diagnostics']['httpExchangeCount'], 1)
+
     def test_missing_and_duplicate_response(self):
         log = self.root / 'api_logs.log'
         log.write_text(log.read_text() + '\n' + log.read_text())

@@ -168,3 +168,25 @@ HTTP-status failure. Unit-test fixtures are not evidence of Hercules integration
   intentionally expected HTTP 201 from the same read-only health endpoint.
 - Target login, contract ID discovery, deletion and a complete browser-button
   execution through the platform have not yet been acceptance-tested.
+
+## Failure diagnostics
+
+New jobs retain a bounded list of API method/status pairs classified as login,
+contract list, contract detail, or other. Explicit failure language is converted
+to fixed model-reported hints (authentication, missing test data, connection,
+timeout, assertion mismatch). These hints are not independent proof of cause.
+The platform shows this summary in the existing execution detail. Raw URLs,
+headers, bodies, credentials and free-form model output are still discarded.
+Existing jobs cannot be enriched after their scratch artifacts were deleted.
+
+## Request correlation
+
+New runs instruct Hercules to add a unique `X-Hercules-Request-Id` header only
+to the request under test, after authentication and discovery are complete.
+The verifier requires one marked request and one matching original response;
+discovery responses cannot be selected instead. Duplicate/missing markers,
+wrong origins and mismatched paths remain errors. Missing responses and multiple
+responses now have separate diagnostics. No HTTP requests are replayed.
+Query-only scenarios instruct the agent not to create or modify business data
+unless the case steps explicitly request it. This instruction is not a network
+write-blocking mechanism. Existing run verdicts are not retroactively changed.
